@@ -68,15 +68,34 @@ class LobbyWindow:
     """
     Shown before the game starts.
     Returns a net_config dict (or None for local play) via self.result.
+
+    All background-thread → UI communication goes through self._lobby_queue
+    polled via root.after(), so we never call Tk from a non-main thread.
     """
     def __init__(self, root):
         self.root = root
-        self.result = None          # set when lobby completes
+        self.result = None
         self._server_sock = None
-        self._client_sock = None
-        self._hosting = False
+        self._lobby_queue = queue.Queue()
 
         self._build()
+        self._poll()   # start polling the queue on the main thread
+
+    def _poll(self):
+        """Drain the lobby queue on the main thread."""
+        try:
+            while True:
+                fn = self._lobby_queue.get_nowait()
+                fn()
+        except queue.Empty:
+            pass
+        # Keep polling only while the lobby window still exists
+        if self.win.winfo_exists():
+            self.root.after(50, self._poll)
+
+    def _schedule(self, fn):
+        """Post a callable to be run on the main thread."""
+        self._lobby_queue.put(fn)
 
     def _build(self):
         self.win = tk.Toplevel(self.root)
@@ -94,22 +113,18 @@ class LobbyWindow:
                  font=("Arial", 10)).pack(pady=(0, 20))
 
         btn_cfg = dict(relief="flat", font=("Arial", 11, "bold"),
-                       pady=10, width=18,
-                       activeforeground="white")
+                       pady=10, width=18, activeforeground="white")
 
         tk.Button(self.win, text="▶  Local Game",
-                  bg="#2e8b2e", fg="white",
-                  activebackground="#3aad3a",
+                  bg="#2e8b2e", fg="white", activebackground="#3aad3a",
                   command=self._local, **btn_cfg).pack(padx=40, pady=6)
 
         tk.Button(self.win, text="⬆  Host Game",
-                  bg="#1a6abf", fg="white",
-                  activebackground="#2281e8",
+                  bg="#1a6abf", fg="white", activebackground="#2281e8",
                   command=self._host, **btn_cfg).pack(padx=40, pady=6)
 
         tk.Button(self.win, text="⬇  Join Game",
-                  bg="#7b3fbf", fg="white",
-                  activebackground="#9b55e0",
+                  bg="#7b3fbf", fg="white", activebackground="#9b55e0",
                   command=self._join, **btn_cfg).pack(padx=40, pady=6)
 
         self.status = tk.Label(self.win, text="", bg=bg, fg="#f0a500",
@@ -129,17 +144,14 @@ class LobbyWindow:
         if port is None:
             return
 
-        # Ask host which colour they want
         assign = self._ask_assignment()
         if assign is None:
             return
 
-        self._hosting = True
         self.status.config(text=f"Waiting for opponent to connect…\n"
                                f"Your IP: {get_local_ip()}   Port: {port}")
         self.win.update()
 
-        # Listen in background thread; post result via after()
         def listen():
             try:
                 srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -148,11 +160,11 @@ class LobbyWindow:
                 srv.listen(1)
                 self._server_sock = srv
                 conn, addr = srv.accept()
-                self._client_sock = conn
-                self.win.after(0, lambda: self._host_connected(conn, addr, assign))
+                # Hand off to main thread via queue — never touch Tk from here
+                self._schedule(lambda: self._host_connected(conn, addr, assign))
             except Exception as e:
-                self.win.after(0, lambda: self.status.config(
-                    text=f"Error: {e}"))
+                err = str(e)
+                self._schedule(lambda: self.status.config(text=f"Error: {err}"))
 
         threading.Thread(target=listen, daemon=True).start()
 
@@ -197,8 +209,8 @@ class LobbyWindow:
         return result[0]
 
     def _host_connected(self, conn, addr, host_player):
+        """Called on the main thread once a client has connected."""
         client_player = "O" if host_player == "X" else "X"
-        # Tell client their assigned colour
         send_msg(conn, {"type": "assign", "player": client_player})
         self.result = {
             "mode": "host",
@@ -230,16 +242,16 @@ class LobbyWindow:
             try:
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.connect((host, port))
-                self._client_sock = s
-                self.win.after(0, lambda: self._join_connected(s))
+                self._schedule(lambda: self._join_connected(s))
             except Exception as e:
-                self.win.after(0, lambda: self.status.config(
-                    text=f"Could not connect: {e}"))
+                err = str(e)
+                self._schedule(lambda: self.status.config(
+                    text=f"Could not connect: {err}"))
 
         threading.Thread(target=connect, daemon=True).start()
 
     def _join_connected(self, sock):
-        # Wait for assignment message
+        """Called on the main thread once connected to host."""
         msg = recv_msg(sock)
         if msg and msg.get("type") == "assign":
             self.result = {
@@ -268,23 +280,18 @@ class HexTicTacToeGUI:
         self.root = root
         self.root.title("Hex Tic-Tac-Toe")
 
-        # ── Network config ───────────────────────────────────────────────────
-        # net_config keys:
-        #   mode        : "local" | "host" | "client"
-        #   sock        : connected socket (host/client only)
-        #   my_player   : "X" or "O"  (host/client only)
-        self.net_mode   = net_config["mode"]                          # "local"|"host"|"client"
-        self.net_sock   = net_config.get("sock")                      # socket or None
-        self.my_player  = net_config.get("my_player", "X")           # our colour
-        self.is_host    = self.net_mode in ("local", "host")
-        self._net_queue = queue.Queue()                               # incoming messages
+        self.net_mode  = net_config["mode"]
+        self.net_sock  = net_config.get("sock")
+        self.my_player = net_config.get("my_player", "X")
+        self.is_host   = self.net_mode in ("local", "host")
+        self._net_queue = queue.Queue()
 
-        # ── Grid appearance ──────────────────────────────────────────────────
+        # ---- Grid appearance ------------------------------------------------
         # Change these three values to customise the grid look:
         self.GRID_COLOR = "#2e8b2e"
         self.GRID_WIDTH = 2
         self.GRID_BG    = "white"
-        # ────────────────────────────────────────────────────────────────────
+        # ---------------------------------------------------------------------
 
         self.base_size   = 30
         self.zoom_level  = 1.0
@@ -303,7 +310,6 @@ class HexTicTacToeGUI:
         self.setup_ui()
         self._redraw_grid()
 
-        # Start network listener if networked
         if self.net_sock:
             threading.Thread(target=self._net_recv_loop, daemon=True).start()
             self.root.after(50, self._poll_net_queue)
@@ -319,7 +325,6 @@ class HexTicTacToeGUI:
                  font=("Arial", 14, "bold"), justify="center"
                  ).pack(pady=(20, 4))
 
-        # Network status badge
         if self.net_mode == "host":
             badge_text = f"🔗 Hosting  (you are {self.my_player})"
             badge_col  = "#1a6abf"
@@ -336,7 +341,6 @@ class HexTicTacToeGUI:
 
         tk.Frame(sidebar, bg="#444", height=1).pack(fill="x", padx=16, pady=4)
 
-        # Turn indicator
         tk.Label(sidebar, text="CURRENT TURN",
                  bg="#1e1e1e", fg="#aaa", font=("Arial", 8)).pack(pady=(12, 0))
 
@@ -350,7 +354,6 @@ class HexTicTacToeGUI:
                                    font=("Arial", 13, "bold"))
         self.turn_label.pack(side="left")
 
-        # "your turn" indicator for networked play
         self.your_turn_label = tk.Label(sidebar, text="",
                                         bg="#1e1e1e", fg="#f0a500",
                                         font=("Arial", 8, "italic"))
@@ -358,7 +361,6 @@ class HexTicTacToeGUI:
 
         tk.Frame(sidebar, bg="#444", height=1).pack(fill="x", padx=16, pady=12)
 
-        # Win length
         tk.Label(sidebar, text="WIN LENGTH",
                  bg="#1e1e1e", fg="#aaa", font=("Arial", 8)).pack()
 
@@ -389,7 +391,6 @@ class HexTicTacToeGUI:
                                          font=("Arial", 8))
         self.wl_pending_label.pack(pady=(0, 8))
 
-        # Restart button
         self.restart_btn = tk.Button(
             sidebar, text="⟳  Restart",
             command=self._restart,
@@ -403,13 +404,11 @@ class HexTicTacToeGUI:
                  bg="#1e1e1e", fg="#666", font=("Arial", 8),
                  justify="center").pack(side="bottom", pady=16)
 
-        # Disable host-only controls for client
         if not self.is_host:
             for w in (self.wl_dec_btn, self.wl_inc_btn, self.restart_btn):
                 w.config(state="disabled", bg="#2a2a2a", fg="#555",
                          activebackground="#2a2a2a", activeforeground="#555")
 
-        # Canvas
         self.canvas = tk.Canvas(self.root, bg=self.GRID_BG)
         self.canvas.pack(side="left", fill="both", expand=True)
 
@@ -426,7 +425,6 @@ class HexTicTacToeGUI:
 
     # ------------------------------------------------------------------ net
     def _net_recv_loop(self):
-        """Background thread: receive messages and push to queue."""
         while True:
             msg = recv_msg(self.net_sock)
             if msg is None:
@@ -435,7 +433,6 @@ class HexTicTacToeGUI:
             self._net_queue.put(msg)
 
     def _poll_net_queue(self):
-        """Main thread: drain the queue and handle messages."""
         try:
             while True:
                 msg = self._net_queue.get_nowait()
@@ -463,18 +460,17 @@ class HexTicTacToeGUI:
                 self._update_turn_ui()
 
         elif t == "restart":
-            new_wl = msg.get("win_length", self.win_length)
-            new_first = msg.get("first_player", "X")
-            self._do_restart(win_length=new_wl, first_player=new_first)
+            self._do_restart(win_length=msg.get("win_length", self.win_length),
+                             first_player=msg.get("first_player", "X"))
 
         elif t == "win_length":
-            # Host broadcast pending win length change so client UI updates too
             self.pending_win_length = msg["value"]
             self.wl_label.config(text=str(self.pending_win_length))
             self._update_pending_label()
 
         elif t == "disconnect":
-            messagebox.showwarning("Disconnected", "The other player has disconnected.")
+            messagebox.showwarning("Disconnected",
+                                   "The other player has disconnected.")
 
     def _send(self, obj):
         if self.net_sock:
@@ -483,7 +479,7 @@ class HexTicTacToeGUI:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------ turn helpers
+    # ------------------------------------------------------------------ turn
     def _update_turn_ui(self):
         self.turn_label.config(text=f"Player {self.current_player}")
         self.turn_swatch.config(bg=self.colors[self.current_player])
@@ -496,9 +492,7 @@ class HexTicTacToeGUI:
             self.your_turn_label.config(text="")
 
     def _is_my_turn(self):
-        if self.net_mode == "local":
-            return True
-        return self.current_player == self.my_player
+        return self.net_mode == "local" or self.current_player == self.my_player
 
     # ------------------------------------------------------------------ win length
     def _dec_win_length(self):
@@ -522,7 +516,6 @@ class HexTicTacToeGUI:
 
     # ------------------------------------------------------------------ restart
     def _restart(self):
-        """Host-only: broadcast restart then apply locally."""
         self._send({
             "type": "restart",
             "win_length": self.pending_win_length,
@@ -536,18 +529,14 @@ class HexTicTacToeGUI:
             self.pending_win_length = win_length
             self.wl_label.config(text=str(self.win_length))
         self._update_pending_label()
-
         self.board = {}
         self.current_player = first_player
         self._update_turn_ui()
-
         self.canvas.delete("all")
         self.grid_items.clear()
-
         self.zoom_level = 1.0
         self.offset_x   = 0.0
         self.offset_y   = 0.0
-
         self._redraw_grid()
 
     # ------------------------------------------------------------------ zoom
@@ -682,7 +671,6 @@ class HexTicTacToeGUI:
                                 font=("Arial", font_size, "bold"),
                                 tags="piece_label")
 
-        # Broadcast move to peer
         self._send({"type": "move", "q": q, "r": r, "player": player})
 
         if self.check_win(q, r):
@@ -715,7 +703,7 @@ class HexTicTacToeGUI:
 
 def main():
     root = tk.Tk()
-    root.withdraw()   # hide main window until lobby is done
+    root.withdraw()
 
     lobby = LobbyWindow(root)
     root.wait_window(lobby.win)
